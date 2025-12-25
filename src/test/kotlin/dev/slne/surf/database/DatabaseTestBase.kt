@@ -12,6 +12,7 @@ import io.r2dbc.spi.ConnectionFactoryOptions.HOST
 import io.r2dbc.spi.ConnectionFactoryOptions.PASSWORD
 import io.r2dbc.spi.ConnectionFactoryOptions.PORT
 import io.r2dbc.spi.ConnectionFactoryOptions.USER
+import io.r2dbc.spi.Option
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.testcontainers.containers.MariaDBContainer
@@ -42,6 +43,8 @@ abstract class DatabaseTestBase {
             .option(USER, mariaDb.username)
             .option(PASSWORD, mariaDb.password)
             .option(DATABASE, mariaDb.databaseName)
+            // Set transaction isolation at SESSION level to match production behavior
+            .option(Option.valueOf("sessionVariables"), "transaction_isolation='REPEATABLE-READ'")
             .build()
 
         val config = ConnectionPoolConfiguration.builder()
