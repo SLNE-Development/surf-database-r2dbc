@@ -99,6 +99,7 @@ class DatabaseApi internal constructor(val database: R2dbcDatabase) {
             val database = R2dbcDatabase.connect(connectionFactory, R2dbcDatabaseConfig {
                 explicitDialect = MariaDBDialect()
                 sqlLogger = ComponentSqlLogger(logger, Level.DEBUG)
+                defaultIsolationLevel = null // Prevent "Transaction characteristics can't be changed" warning with MariaDB
                 configCustomizer()
             })
 
