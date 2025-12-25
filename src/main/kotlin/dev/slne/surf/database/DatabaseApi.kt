@@ -29,6 +29,13 @@ class DatabaseApi internal constructor(val database: R2dbcDatabase) {
 
     companion object {
         /**
+         * MariaDB session variable to set transaction isolation level at session level.
+         * This prevents "Transaction characteristics can't be changed" warnings when Exposed
+         * tries to set isolation level after a transaction has started.
+         */
+        private const val MARIADB_SESSION_ISOLATION = "transaction_isolation='REPEATABLE-READ'"
+        
+        /**
          * Creates a [DatabaseApi] using the [DatabaseConfig] located in/relative to [pluginPath].
          *
          * This is the intended production entry point: it reads credentials/pool settings from the config and creates a
@@ -54,7 +61,7 @@ class DatabaseApi internal constructor(val database: R2dbcDatabase) {
                 option(PASSWORD, config.credentials.password)
                 option(DATABASE, config.credentials.database)
                 // Set transaction isolation at SESSION level to prevent "Transaction characteristics can't be changed" warning
-                option(Option.valueOf("sessionVariables"), "transaction_isolation='REPEATABLE-READ'")
+                option(Option.valueOf("sessionVariables"), MARIADB_SESSION_ISOLATION)
             }.build()
 
             val connectionFactory = MariadbConnectionFactoryProvider()
