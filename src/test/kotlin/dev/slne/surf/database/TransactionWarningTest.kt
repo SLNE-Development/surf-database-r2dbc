@@ -18,19 +18,19 @@ class TransactionWarningTest : DatabaseTestBase() {
         
         suspendTransaction {
             exec("SELECT 1") { result ->
-                assertEquals(result.get(1), 1)
+                assertEquals(1, result.get(1))
             }
         }
         
         suspendTransaction {
             exec("SELECT 2") { result ->
-                assertEquals(result.get(1), 2)
+                assertEquals(2, result.get(1))
             }
         }
         
         suspendTransaction {
             exec("SELECT 3") { result ->
-                assertEquals(result.get(1), 3)
+                assertEquals(3, result.get(1))
             }
         }
     }
@@ -40,15 +40,15 @@ class TransactionWarningTest : DatabaseTestBase() {
         // Execute multiple queries within a single transaction
         suspendTransaction {
             exec("SELECT 1") { result ->
-                assertEquals(result.get(1), 1)
+                assertEquals(1, result.get(1))
             }
             
             exec("SELECT 2") { result ->
-                assertEquals(result.get(1), 2)
+                assertEquals(2, result.get(1))
             }
             
             exec("SELECT 3") { result ->
-                assertEquals(result.get(1), 3)
+                assertEquals(3, result.get(1))
             }
         }
     }
