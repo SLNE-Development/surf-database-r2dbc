@@ -8,6 +8,7 @@ import io.r2dbc.pool.ConnectionPoolConfiguration
 import io.r2dbc.spi.ConnectionFactory
 import io.r2dbc.spi.ConnectionFactoryOptions
 import io.r2dbc.spi.ConnectionFactoryOptions.*
+import io.r2dbc.spi.Option
 import net.kyori.adventure.text.logger.slf4j.ComponentLogger
 import org.jetbrains.exposed.v1.core.vendors.MariaDBDialect
 import org.jetbrains.exposed.v1.r2dbc.R2dbcDatabase
@@ -52,6 +53,8 @@ class DatabaseApi internal constructor(val database: R2dbcDatabase) {
                 option(USER, config.credentials.username)
                 option(PASSWORD, config.credentials.password)
                 option(DATABASE, config.credentials.database)
+                // Set transaction isolation at SESSION level to prevent "Transaction characteristics can't be changed" warning
+                option(Option.valueOf("sessionVariables"), "transaction_isolation='REPEATABLE-READ'")
             }.build()
 
             val connectionFactory = MariadbConnectionFactoryProvider()
@@ -99,7 +102,6 @@ class DatabaseApi internal constructor(val database: R2dbcDatabase) {
             val database = R2dbcDatabase.connect(connectionFactory, R2dbcDatabaseConfig {
                 explicitDialect = MariaDBDialect()
                 sqlLogger = ComponentSqlLogger(logger, Level.DEBUG)
-                defaultIsolationLevel = null // Prevent "Transaction characteristics can't be changed" warning with MariaDB
                 configCustomizer()
             })
 
