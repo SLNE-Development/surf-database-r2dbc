@@ -33,8 +33,6 @@ class TransactionWarningTest : DatabaseTestBase() {
                 assertEquals(result.get(1), 3)
             }
         }
-        
-        Unit
     }
     
     @Test
@@ -53,7 +51,5 @@ class TransactionWarningTest : DatabaseTestBase() {
                 assertEquals(result.get(1), 3)
             }
         }
-        
-        Unit
     }
 }
