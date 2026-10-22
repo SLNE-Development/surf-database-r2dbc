@@ -29,7 +29,7 @@ system.
 Lifecycle:
 
 1. Create the API from a plugin path (loads configuration)
-2. Initialize tables
+2. Migrate the schema
 3. Execute queries using Exposed
 4. Shutdown on application termination
 
@@ -56,14 +56,14 @@ abstract class DatabaseService {
     )
 
     suspend fun connect() {
-        initializeTables()
+        migrate()
     }
 
     @MustBeInvokedByOverriders
     @ApiStatus.OverrideOnly
-    protected open suspend fun initializeTables() {
-        // Initialize database schema using Exposed
-        // See: https://www.jetbrains.com/help/exposed/working-with-tables.html#dsl-create-table
+    protected open suspend fun migrate() {
+        // Bring the database schema up to date with Flyway migrations
+        // See the "Migrations" section below
     }
 
     fun disconnect() {
@@ -80,14 +80,139 @@ val databaseApi get() = DatabaseService.get().databaseApi
 
 @AutoService(DatabaseService::class)
 class MyDatabaseService : DatabaseService() {
-    override suspend fun initializeTables() {
-        super.initializeTables()
-        // suspendTransaction {
-        //     SchemaUtils.create(UsersTable, ItemsTable)
-        // }
+    override suspend fun migrate() {
+        super.migrate()
+        databaseApi.migrate("my_plugin") {
+            sql("db/migrations")
+        }
     }
 }
 ```
+
+---
+
+## Migrations
+
+Schema changes are applied with [Flyway](https://flywaydb.org/). Every plugin describes its own
+migrations and runs them with `DatabaseApi.migrate(name) { ... }`, typically inside `connect()`.
+`migrate` is a suspend function and runs on `Dispatchers.IO`.
+
+```kotlin
+suspend fun connect() {
+    val result = databaseApi.migrate("my_plugin") {
+        sql("db/migrations")                                  // V<n>__<desc>.sql files on the classpath
+        classes(V2_BackfillItems)                             // code migrations
+        classPackage("dev.slne.surf.myplugin.migrations")     // scan a package for code migrations
+    }
+    logger.info("Applied ${result.migrationsExecuted} migration(s), schema was at ${result.initialVersion}")
+}
+```
+
+At least one of `sql`, `classes` or `classPackage` is required; each may be given more than once.
+`name` must match `[a-z0-9_]{1,40}` (it is lowercased).
+
+`result.targetVersion` is the version of the last migration executed in this run, so it is `null`
+when there was nothing to do; `result.initialVersion` is `null` the first time a plugin migrates
+an empty schema.
+
+**Do not call `migrate()` inside an open transaction.** Flyway uses its own JDBC connection, and on
+MariaDB the metadata locks held by your open transaction can block Flyway's DDL indefinitely.
+
+### SQL files
+
+SQL migrations are classpath resources named `V<version>__<description>.sql`, for example
+`db/migrations/V1__create_users.sql` and `db/migrations/V2__add_items.sql`. They are looked up through
+the plugin's class loader: the class loader of the lambda passed to `migrate` by default, or the one
+you set with `classLoader(...)`.
+
+A location that cannot be found fails `migrate()`, and so does a SQL file whose name does not follow
+the convention (for example `V1_init.sql` with a single underscore), so a typo never silently skips
+migrations.
+
+### History table per plugin
+
+Each `name` gets its own history table `flyway_schema_history_<name>`, so plugins that share a database
+do not interfere with each other, even if they use the same versions.
+
+### Baseline and idempotency
+
+A database without history for `name` is baselined at version `"0"` (change it with
+`baselineVersion(...)`), so a brand-new plugin still runs its `V1` on a shared, non-empty database.
+Because the database may already contain tables created before migrations were introduced, **all
+migrations must be idempotent**:
+
+```sql
+CREATE TABLE IF NOT EXISTS users (
+    id   BINARY(16)   NOT NULL PRIMARY KEY,
+    name VARCHAR(64)  NOT NULL
+);
+```
+
+### Code migrations
+
+For changes that SQL cannot express, extend one of:
+
+- `JdbcMigration` runs on plain JDBC inside the transaction of the migration run. Do not commit or
+  close the connection yourself.
+- `ExposedMigration` runs in a `suspendTransaction` using Exposed over R2DBC. This transaction is
+  **not** the one that records the migration in the history table, so if the process stops between the
+  two, the migration runs again on the next start.
+
+```kotlin
+object V2_BackfillItems : ExposedMigration("2", "backfill item names") {
+    override suspend fun R2dbcTransaction.migrate() {
+        // Plain SQL, so the migration keeps working when ItemsTable changes later. Idempotent.
+        exec("UPDATE items SET display_name = name WHERE display_name IS NULL")
+    }
+}
+```
+
+### Failed migrations
+
+A failed migration makes `migrate()` throw with the migration's version and description in the
+message. Whether a row is left in `flyway_schema_history_<name>` depends on the database:
+
+| Migration          | MariaDB            | PostgreSQL                                       |
+|--------------------|--------------------|--------------------------------------------------|
+| SQL file           | recorded as failed | rolled back, no row                              |
+| `JdbcMigration`    | recorded as failed | rolled back, no row                              |
+| `ExposedMigration` | recorded as failed | its own transaction is rolled back, no row       |
+
+MariaDB cannot roll back DDL, so Flyway records **every** failed migration there as failed
+(`success = false`), whether it changed the schema, only data, or nothing at all. While such a row
+exists, every later `migrate()` for that plugin fails. There is no repair API: fix the migration, undo
+or finish what it partially did, then delete the failed row manually from
+`flyway_schema_history_<name>`. This is another reason migrations must be idempotent: after fixing the
+problem the migration runs again against a possibly partially changed schema.
+
+### Generating a script (development helper)
+
+`DatabaseApi.generateMigrationScript(...)` compares Exposed tables with the database and writes the
+difference to a SQL file you can use as the next migration:
+
+```kotlin
+databaseApi.generateMigrationScript(
+    ItemsTable,
+    scriptDirectory = Path.of("src/main/resources/db/migrations"),
+    scriptName = "V2__items"
+)
+```
+
+Run it against a database that does not yet contain the change. The generated statements are **not
+idempotent** (for example a plain `CREATE TABLE`); edit the file before shipping it.
+
+### Safety
+
+`clean` is disabled, so Flyway never drops objects from your database.
+
+### Upgrade notes (2.4.0)
+
+The shaded jar now merges the `META-INF/services` files of all bundled libraries (Flyway needs this
+to find its database plugins). As a side effect, service registrations of the relocated libraries
+that had no effect in earlier versions are now active, for example Exposed's R2DBC `TypeMapper`s and
+the plugins of the R2DBC MariaDB (`AuthenticationPlugin`) and PostgreSQL (`Extension`) drivers. If
+you worked around missing type mappings or driver plugins, check whether the workaround is still
+needed.
 
 ---
 
@@ -98,10 +223,11 @@ class MyDatabaseService : DatabaseService() {
 The `DatabaseApi.create(pluginPath)` method loads configuration from a `database.yml` file located
 relative to the provided path.
 
-Example `database.yml`:
+Example `database.yml` (keys are kebab-case; camelCase keys are silently ignored):
 
 ```yaml
 credentials:
+  database-type: MARIADB
   host: localhost
   port: 3306
   username: myuser
@@ -110,18 +236,18 @@ credentials:
 
 pool:
   sizing:
-    initialSize: 5
-    minIdle: 5
-    maxSize: 20
+    initial-size: 5
+    min-idle: 5
+    max-size: 20
 
   timeouts:
-    maxAcquireTimeMillis: 30000
-    maxCreateConnectionTimeMillis: 10000
-    maxIdleTimeMillis: 600000
-    maxLifeTimeMillis: 1800000
-    maxValidationTimeMillis: 5000
+    max-acquire-time-millis: 30000
+    max-create-connection-time-millis: 10000
+    max-idle-time-millis: 600000
+    max-life-time-millis: 1800000
+    max-validation-time-millis: 5000
 
-logLevel: DEBUG
+log-level: DEBUG
 ```
 
 ### Runtime environment variables
@@ -138,22 +264,22 @@ a timeout.
 
 | Environment variable                                   | YAML option                                   | Built-in default                                   |
 |--------------------------------------------------------|-----------------------------------------------|----------------------------------------------------|
-| `SURF_DATABASE_LOG_LEVEL`                              | `logLevel`                                    | `DEBUG`                                            |
-| `SURF_DATABASE_TYPE`                                   | `credentials.databaseType`                    | `MARIADB`                                          |
+| `SURF_DATABASE_LOG_LEVEL`                              | `log-level`                                   | `DEBUG`                                            |
+| `SURF_DATABASE_TYPE`                                   | `credentials.database-type`                   | `MARIADB`                                          |
 | `SURF_DATABASE_SCHEMA`                                 | `credentials.schema`                          | `public` (PostgreSQL only)                         |
 | `SURF_DATABASE_HOST`                                   | `credentials.host`                            | `localhost`                                        |
-| `SURF_DATABASE_PORT`                                   | `credentials.port`                            | `3306`; valid range `1..65535`                     |
+| `SURF_DATABASE_PORT`                                   | `credentials.port`                            | `3306` (MariaDB) or `5432` (PostgreSQL); `1..65535` |
 | `SURF_DATABASE_NAME`                                   | `credentials.database`                        | `database`                                         |
 | `SURF_DATABASE_USERNAME`                               | `credentials.username`                        | `root`                                             |
 | `SURF_DATABASE_PASSWORD`                               | `credentials.password`                        | existing YAML/default value; configure as a secret |
-| `SURF_DATABASE_POOL_INITIAL_SIZE`                      | `pool.sizing.initialSize`                     | `10`                                               |
-| `SURF_DATABASE_POOL_MIN_IDLE`                          | `pool.sizing.minIdle`                         | `0`                                                |
-| `SURF_DATABASE_POOL_MAX_SIZE`                          | `pool.sizing.maxSize`                         | `10`                                               |
-| `SURF_DATABASE_POOL_MAX_ACQUIRE_TIME_MILLIS`           | `pool.timeouts.maxAcquireTimeMillis`          | `10000`                                            |
-| `SURF_DATABASE_POOL_MAX_CREATE_CONNECTION_TIME_MILLIS` | `pool.timeouts.maxCreateConnectionTimeMillis` | `30000`                                            |
-| `SURF_DATABASE_POOL_MAX_VALIDATION_TIME_MILLIS`        | `pool.timeouts.maxValidationTimeMillis`       | `-1`                                               |
-| `SURF_DATABASE_POOL_MAX_IDLE_TIME_MILLIS`              | `pool.timeouts.maxIdleTimeMillis`             | `60000`                                            |
-| `SURF_DATABASE_POOL_MAX_LIFE_TIME_MILLIS`              | `pool.timeouts.maxLifeTimeMillis`             | `1800000`                                          |
+| `SURF_DATABASE_POOL_INITIAL_SIZE`                      | `pool.sizing.initial-size`                    | `10`                                               |
+| `SURF_DATABASE_POOL_MIN_IDLE`                          | `pool.sizing.min-idle`                        | `0`                                                |
+| `SURF_DATABASE_POOL_MAX_SIZE`                          | `pool.sizing.max-size`                        | `10`                                               |
+| `SURF_DATABASE_POOL_MAX_ACQUIRE_TIME_MILLIS`           | `pool.timeouts.max-acquire-time-millis`       | `10000`                                            |
+| `SURF_DATABASE_POOL_MAX_CREATE_CONNECTION_TIME_MILLIS` | `pool.timeouts.max-create-connection-time-millis` | `30000`                                            |
+| `SURF_DATABASE_POOL_MAX_VALIDATION_TIME_MILLIS`        | `pool.timeouts.max-validation-time-millis`    | `-1`                                               |
+| `SURF_DATABASE_POOL_MAX_IDLE_TIME_MILLIS`              | `pool.timeouts.max-idle-time-millis`          | `60000`                                            |
+| `SURF_DATABASE_POOL_MAX_LIFE_TIME_MILLIS`              | `pool.timeouts.max-life-time-millis`          | `1800000`                                          |
 
 MariaDB example:
 
@@ -283,7 +409,7 @@ class DatabaseTest {
 ## Supported Databases
 
 The configuration-based entry point supports **MariaDB** and **PostgreSQL** through their R2DBC
-drivers. Set `credentials.databaseType` or `SURF_DATABASE_TYPE` to select the driver.
+drivers. Set `credentials.database-type` or `SURF_DATABASE_TYPE` to select the driver.
 `credentials.schema` and `SURF_DATABASE_SCHEMA` apply only to PostgreSQL and are safely ignored for
 MariaDB.
 
@@ -301,7 +427,7 @@ Guaranteed:
 Not guaranteed:
 
 * Support for databases other than MariaDB and PostgreSQL without custom setup
-* Automatic schema migrations
+* Automatic schema migrations without calling `migrate`
 * Cross-database transactions
 
 ---
@@ -322,15 +448,15 @@ Failing to do so may leave connections open and cause resource leaks.
 
 ---
 
-### 2. Creating `DatabaseApi` after table initialization
+### 2. Creating `DatabaseApi` after migrating
 
-Table initialization requires a database connection. Always create `DatabaseApi` **before** calling
-`initializeTables()`:
+Migrating requires a database connection. Always create `DatabaseApi` **before** calling
+`migrate()`:
 
 ```kotlin
 // BAD
 suspend fun connect() {
-    initializeTables() // database not ready yet
+    migrate() // database not ready yet
     databaseApi = DatabaseApi.create(pluginPath)
 }
 ```
@@ -339,11 +465,11 @@ suspend fun connect() {
 // GOOD
 suspend fun connect() {
     databaseApi = DatabaseApi.create(pluginPath)
-    initializeTables()
+    migrate()
 }
 ```
 
-Or better: initialize `databaseApi` as a class property, then call `initializeTables()` in
+Or better: initialize `databaseApi` as a class property, then call `migrate()` in
 `connect()`.
 
 ---
@@ -370,23 +496,21 @@ transaction {
 
 ---
 
-### 4. Ignoring `suspend` for `initializeTables()`
+### 4. Ignoring `suspend` for `migrate()`
 
-The `initializeTables()` method must be `suspend` to allow safe schema initialization:
+The `migrate()` method must be `suspend` to allow safe schema initialization:
 
 ```kotlin
 // BAD
-protected open fun initializeTables() {
+protected open fun migrate() {
     // Cannot use suspending functions here
 }
 ```
 
 ```kotlin
 // GOOD
-protected open suspend fun initializeTables() {
-    suspendTransaction {
-        SchemaUtils.create(UsersTable)
-    }
+protected open suspend fun migrate() {
+    databaseApi.migrate("my_plugin") { sql("db/migrations") }
 }
 ```
 
@@ -396,7 +520,7 @@ protected open suspend fun initializeTables() {
 
 The connection pool has a maximum size defined in `database.yml`.
 
-If all connections are in use, new transactions will wait up to `maxAcquireTimeMillis` before
+If all connections are in use, new transactions will wait up to `max-acquire-time-millis` before
 failing.
 
 Monitor connection usage and adjust pool sizing if needed:
@@ -404,7 +528,7 @@ Monitor connection usage and adjust pool sizing if needed:
 ```yaml
 pool:
   sizing:
-    maxSize: 50  # Increase if needed
+    max-size: 50  # Increase if needed
 ```
 
 ---

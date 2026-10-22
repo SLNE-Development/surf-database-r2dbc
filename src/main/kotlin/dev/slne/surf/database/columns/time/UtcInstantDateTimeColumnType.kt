@@ -94,8 +94,7 @@ abstract class UtcInstantDateTimeColumnType<T : Any> :
             currentDialect is SQLiteDialect ->
                 SQLITE_AND_ORACLE_DATE_TIME_STRING_FORMATTER.format(utcDateTime)
 
-            else ->
-                Timestamp.valueOf(utcDateTime)
+            else -> utcDateTime
         }
     }
 

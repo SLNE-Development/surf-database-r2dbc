@@ -5,6 +5,7 @@ import dev.slne.surf.database.config.DatabaseConfig
 import dev.slne.surf.database.config.DatabaseType
 import dev.slne.surf.database.health.DatabaseHealthRegistry
 import dev.slne.surf.database.logger.ComponentSqlLogger
+import dev.slne.surf.database.migration.internal.JdbcDataSources
 import io.r2dbc.pool.ConnectionPool
 import io.r2dbc.pool.ConnectionPoolConfiguration
 import io.r2dbc.postgresql.PostgresqlConnectionConfiguration
@@ -25,6 +26,7 @@ import reactor.netty.resources.LoopResources
 import java.nio.file.Path
 import java.time.Duration.ofMillis
 import java.util.concurrent.atomic.AtomicLong
+import javax.sql.DataSource
 
 /**
  * Small wrapper around an [R2dbcDatabase] instance.
@@ -34,7 +36,9 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class DatabaseApi internal constructor(
     val database: R2dbcDatabase,
-    healthCheckName: String
+    healthCheckName: String,
+    internal val migrationDataSource: DataSource? = null,
+    private val releaseResources: () -> Unit = {},
 ) {
     init {
         DatabaseHealthRegistry.register(
@@ -64,23 +68,23 @@ class DatabaseApi internal constructor(
         ): DatabaseApi {
             val config = DatabaseConfig.create(pluginPath, fileName)
             val databaseType = config.credentials.databaseType
+            val migrationDataSource = JdbcDataSources.create(config.credentials)
+            val loopResources = LoopResources.create(
+                "${databaseType.name.lowercase()}-r2dbc-event-loop-$poolName",
+                1,
+                4,
+                true
+            )
 
             val connectionFactory: ConnectionFactory = when (databaseType) {
                 DatabaseType.MARIADB -> {
                     val configuration = MariadbConnectionConfiguration.builder()
                         .host(config.credentials.host)
-                        .port(config.credentials.port)
+                        .port(config.credentials.resolvedPort)
                         .username(config.credentials.username)
                         .password(config.credentials.password)
                         .database(config.credentials.database)
-                        .loopResources(
-                            LoopResources.create(
-                                "mariadb-r2dbc-event-loop-$poolName",
-                                1,
-                                4,
-                                true
-                            )
-                        )
+                        .loopResources(loopResources)
                         .build()
 
                     MariadbConnectionFactory.from(configuration)
@@ -89,19 +93,12 @@ class DatabaseApi internal constructor(
                 DatabaseType.POSTGRESQL -> {
                     val configuration = PostgresqlConnectionConfiguration.builder()
                         .host(config.credentials.host)
-                        .port(config.credentials.port)
+                        .port(config.credentials.resolvedPort)
                         .username(config.credentials.username)
                         .password(config.credentials.password)
                         .database(config.credentials.database)
                         .schema(config.credentials.schema)
-                        .loopResources(
-                            LoopResources.create(
-                                "postgresql-r2dbc-event-loop-$poolName",
-                                1,
-                                4,
-                                true
-                            )
-                        )
+                        .loopResources(loopResources)
                         .build()
 
                     PostgresqlConnectionFactory(configuration)
@@ -140,12 +137,21 @@ class DatabaseApi internal constructor(
                 logger = logger,
                 logLevel = logLevel,
                 healthCheckName = poolName,
+                migrationDataSource = migrationDataSource,
+                releaseResources = {
+                    try {
+                        pool.dispose()
+                    } finally {
+                        loopResources.dispose()
+                    }
+                },
                 configCustomizer = configCustomizer
             )
         }
 
         /**
-         * Creates a [DatabaseApi] from an already constructed [ConnectionFactory].
+         * Creates a [DatabaseApi] from an already constructed [ConnectionFactory]. Migrations cannot be run on the
+         * result; use the overload with a `migrationDataSource` for that.
          *
          * This overload bypasses [DatabaseConfig] loading and pool creation and is therefore mainly intended for tests or
          * special setups where the caller manages the connection factory manually. Prefer
@@ -164,23 +170,61 @@ class DatabaseApi internal constructor(
             logger: ComponentLogger = ComponentLogger.logger("DatabaseApi"),
             logLevel: Level = Level.DEBUG,
             configCustomizer: R2dbcDatabaseConfig.Builder.() -> Unit = {}
-        ): DatabaseApi {
-            return createDatabase(
-                connectionFactory = connectionFactory,
-                dialect = dialect,
-                logger = logger,
-                logLevel = logLevel,
-                healthCheckName = nextManualHealthCheckName(),
-                configCustomizer = configCustomizer
-            )
-        }
+        ): DatabaseApi = createManual(connectionFactory, dialect, logger, logLevel, null, configCustomizer)
 
-        private fun createDatabase(
+        /**
+         * Creates a [DatabaseApi] from an already constructed [ConnectionFactory] that can run migrations through
+         * [migrationDataSource].
+         *
+         * Like the overload without a data source, this is mainly intended for tests or special setups; the caller
+         * keeps ownership of [connectionFactory] and [migrationDataSource].
+         *
+         * @param connectionFactory The factory to connect with (e.g., testcontainers, in-memory, custom pool).
+         * @param dialect The database dialect to use (e.g., MariaDB, Postgres).
+         * @param migrationDataSource JDBC data source used for schema migrations; it must point at the same database.
+         * @param logger Optional logger for Exposed's SQL logging (defaults to a logger named "DatabaseApi").
+         * @param logLevel Optional log level for Exposed's SQL logging.
+         * @param configCustomizer Optional customization hook for Exposed's [R2dbcDatabaseConfig].
+         */
+        @TestOnlyDatabaseApi
+        fun create(
+            connectionFactory: ConnectionFactory,
+            dialect: DatabaseDialect,
+            migrationDataSource: DataSource,
+            logger: ComponentLogger = ComponentLogger.logger("DatabaseApi"),
+            logLevel: Level = Level.DEBUG,
+            configCustomizer: R2dbcDatabaseConfig.Builder.() -> Unit = {}
+        ): DatabaseApi = createManual(connectionFactory, dialect, logger, logLevel, migrationDataSource, configCustomizer)
+
+        private fun createManual(
+            connectionFactory: ConnectionFactory,
+            dialect: DatabaseDialect,
+            logger: ComponentLogger,
+            logLevel: Level,
+            migrationDataSource: DataSource?,
+            configCustomizer: R2dbcDatabaseConfig.Builder.() -> Unit
+        ): DatabaseApi = createDatabase(
+            connectionFactory = connectionFactory,
+            dialect = dialect,
+            logger = logger,
+            logLevel = logLevel,
+            healthCheckName = nextManualHealthCheckName(),
+            migrationDataSource = migrationDataSource,
+            releaseResources = {},
+            configCustomizer = configCustomizer
+        )
+
+        /**
+         * Builds the [DatabaseApi]; [releaseResources] runs on [shutdown] after the database is unregistered.
+         */
+        internal fun createDatabase(
             connectionFactory: ConnectionFactory,
             dialect: DatabaseDialect,
             logger: ComponentLogger,
             logLevel: Level,
             healthCheckName: String,
+            migrationDataSource: DataSource?,
+            releaseResources: () -> Unit,
             configCustomizer: R2dbcDatabaseConfig.Builder.() -> Unit
         ): DatabaseApi {
             val database = R2dbcDatabase.connect(
@@ -196,7 +240,9 @@ class DatabaseApi internal constructor(
 
             return DatabaseApi(
                 database = database,
-                healthCheckName = healthCheckName
+                healthCheckName = healthCheckName,
+                migrationDataSource = migrationDataSource,
+                releaseResources = releaseResources
             )
         }
 
@@ -212,7 +258,9 @@ class DatabaseApi internal constructor(
     }
 
     /**
-     * Closes and unregisters this database instance from Exposed's [TransactionManager].
+     * Closes and unregisters this database instance from Exposed's [TransactionManager]. For an instance created
+     * from a config file, also disposes the connection pool and its event loop; a [ConnectionFactory] passed in by
+     * the caller is left to the caller.
      *
      * Call this during plugin/application shutdown to ensure connections are released.
      */
@@ -220,7 +268,11 @@ class DatabaseApi internal constructor(
         try {
             TransactionManager.closeAndUnregister(database)
         } finally {
-            DatabaseHealthRegistry.unregister(this)
+            try {
+                DatabaseHealthRegistry.unregister(this)
+            } finally {
+                releaseResources()
+            }
         }
     }
 }
