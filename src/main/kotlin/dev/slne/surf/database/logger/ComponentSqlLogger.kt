@@ -20,6 +20,7 @@ class ComponentSqlLogger(
         transaction: Transaction
     ) {
         logger.atLevel(level)
-            .log("SQL: ${context.expandArgs(transaction)}")
+            .addArgument { context.expandArgs(transaction) }
+            .log("SQL: {}")
     }
 }
